@@ -44,6 +44,21 @@ func (ws *WanServer) Init(param *tagConfig) {
 	log.Fatal(gnet.Serve(ws, fmt.Sprintf("tcp://:%d", ws.config.port), gnet.WithMulticore(true)))
 }
 
+// 销毁
+func (ws *WanServer) Destroy() {
+
+}
+
+// 发送
+func (ws *WanServer) Send(clientId int, msg []byte) {
+
+}
+
+// 接收
+func (ws *WanServer) Recv(clientId int) []byte {
+	return nil
+}
+
 func (ws *WanServer) RoutineSend(client *tagClient) {
 	ws.connectedSockets.Range(func(key, value interface{}) bool {
 		addr := key.(string)
@@ -60,16 +75,18 @@ func (ws *WanServer) RoutineUnauth() {
 	for {
 		client := <-ws.unauthClient
 
-		if client.shutdown {
-			continue
-		}
+		select {
+		case <-client.shutdown:
+			break
 
-		if client.clientId < 0 {
-			diff := time.Now().Sub(client.connectTime).Microseconds() - ws.config.authTime
-			if diff > 0 {
-				client.connection.Close()
-			} else {
-				ws.unauthClient <- client
+		default:
+			if client.clientId < 0 {
+				diff := time.Now().Sub(client.connectTime).Microseconds() - ws.config.authTime
+				if diff > 0 {
+					client.connection.Close()
+				} else {
+					ws.unauthClient <- client
+				}
 			}
 		}
 	}
@@ -93,7 +110,7 @@ func (ws *WanServer) OnOpened(c gnet.Conn) (out []byte, action gnet.Action) {
 	select {
 	case client := <-ws.freeClient:
 		client.clientId = -1
-		client.shutdown = false
+		client.shutdown = make(chan bool, 1)
 		client.connection = c
 		client.connectTime = time.Now()
 		client.recvSerial = 0
@@ -130,8 +147,11 @@ func (ws *WanServer) React(frame []byte, c gnet.Conn) (out []byte, action gnet.A
 
 	client := connection.(*tagClient)
 
-	if client.shutdown {
+	select {
+	case <-client.shutdown:
 		return
+
+	default:
 	}
 
 	if client.clientId < 0 {
@@ -145,6 +165,11 @@ func (ws *WanServer) React(frame []byte, c gnet.Conn) (out []byte, action gnet.A
 			c.Close()
 			return
 		}
+
+		// 开始发送
+		ants.Submit(func() {
+			ws.RoutineSend(client)
+		})
 	}
 
 	select {
@@ -179,7 +204,7 @@ type tagClient struct {
 	recvQueue chan []byte
 
 	connection gnet.Conn
-	shutdown   bool
+	shutdown   chan bool
 }
 
 type LogHandler interface {
