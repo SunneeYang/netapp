@@ -6,7 +6,7 @@ import (
 	"os"
 )
 
-func ClientHandleError(err error, when string)  {
+func ClientHandleError(err error, when string) {
 	if err != nil {
 		fmt.Println(err, when)
 		os.Exit(1)
@@ -28,10 +28,10 @@ func main() {
 		n, err := conn.Read(buffer)
 		ClientHandleError(err, "client read error")
 
-		serverMsg := string(buffer[0 : n])
+		serverMsg := string(buffer[0:n])
 		fmt.Printf("server push:%s", serverMsg)
 		if serverMsg == "bye" {
-			 break
+			break
 		}
 	}
 }

@@ -1,4 +1,4 @@
-package main
+package ewserver
 
 import (
 	"fmt"
@@ -16,6 +16,8 @@ type WanServer struct {
 	tick             time.Duration
 	connectedSockets sync.Map
 	unauthClient     sync.Map
+	wg               sync.WaitGroup
+	shutdown         int32
 
 	config tagConfig
 
@@ -30,8 +32,9 @@ func (ws *WanServer) Init(param *tagConfig) {
 	ws.client = make([]tagClient, ws.config.maxLoad)
 	ws.freeClient = make(chan *tagClient, ws.config.maxLoad)
 	ws.destroyClient = make(chan *tagClient, ws.config.maxLoad)
+	ws.shutdown = 0
 
-	ants.NewPool(ws.config.maxLoad, ants.WithPreAlloc(true))
+	ants.NewPool(ws.config.maxLoad+2, ants.WithPreAlloc(true))
 
 	for i := 0; i < ws.config.maxLoad; i++ {
 		client := &ws.client[i]
@@ -45,12 +48,16 @@ func (ws *WanServer) Init(param *tagConfig) {
 		ws.freeClient <- &ws.client[i]
 	}
 
+	ws.wg.Add(1)
 	ants.Submit(func() {
 		ws.RoutineUnauth()
+		ws.wg.Done()
 	})
 
+	ws.wg.Add(1)
 	ants.Submit(func() {
 		ws.RoutineDestroy()
+		ws.wg.Done()
 	})
 
 	log.Fatal(gnet.Serve(ws, fmt.Sprintf("tcp://:%d", ws.config.port), gnet.WithMulticore(true)))
@@ -58,30 +65,34 @@ func (ws *WanServer) Init(param *tagConfig) {
 
 // 销毁
 func (ws *WanServer) Destroy() {
+	atomic.StoreInt32(&ws.shutdown, 1)
+
+	ws.wg.Wait()
+
 	ants.Release()
 }
 
 // 发送
-func (ws *WanServer) Send(client *tagClient, msg []byte) {
+func (ws *WanServer) Send(handle interface{}, msg []byte) {
+	client := handle.(*tagClient)
+
 	if atomic.LoadInt32(&client.shutdown) != 0 {
 		return
 	}
 
-	client.connection.AsyncWrite(msg)
+	select {
+	case client.sendQueue <- msg:
+		break
 
-	/*
-		select {
-		case client.sendQueue <- msg:
-			break
-
-		default:
-			ws.DisconnectClient(client, 0)
-		}
-	*/
+	default:
+		ws.DisconnectClient(client, 0)
+	}
 }
 
 // 接收
-func (ws *WanServer) Recv(client *tagClient) []byte {
+func (ws *WanServer) Recv(handle interface{}) []byte {
+	client := handle.(*tagClient)
+
 	if atomic.LoadInt32(&client.shutdown) != 0 {
 		return nil
 	}
@@ -90,41 +101,76 @@ func (ws *WanServer) Recv(client *tagClient) []byte {
 }
 
 // 断开
-func (ws *WanServer) Kick(client *tagClient) {
+func (ws *WanServer) Kick(handle interface{}) {
+	client := handle.(*tagClient)
+
 	ws.DisconnectClient(client, 0)
 }
 
 func (ws *WanServer) RoutineUnauth() {
 
-	ws.unauthClient.Range(func(key, value interface{}) bool {
-		client := value.(*tagClient)
-
-		if atomic.LoadInt32(&client.shutdown) != 0 {
-			return true
+	for {
+		if atomic.LoadInt32(&ws.shutdown) != 0 {
+			break
 		}
 
-		if time.Now().UnixNano()-client.connectTime < ws.config.authTime {
+		ws.unauthClient.Range(func(key, value interface{}) bool {
+			client := value.(*tagClient)
+
+			if atomic.LoadInt32(&client.shutdown) != 0 {
+				return true
+			}
+
+			if time.Now().UnixNano()-client.connectTime < ws.config.authTime {
+				return true
+			}
+
+			ws.DisconnectClient(client, 0)
+			ws.unauthClient.Delete(key)
+
 			return true
+		})
+	}
+
+}
+
+func (ws *WanServer) RoutineSend(client *tagClient) {
+
+	for {
+		select {
+		case msg := <-client.sendQueue:
+			client.connection.AsyncWrite(msg)
+			break
+
+		case <-time.After(time.Second):
+			if atomic.LoadInt32(&client.shutdown) != 0 || atomic.LoadInt32(&ws.shutdown) != 0 {
+				return
+			}
 		}
-
-		ws.DisconnectClient(client, 0)
-		ws.unauthClient.Delete(key)
-
-		return true
-	})
+	}
 }
 
 func (ws *WanServer) RoutineDestroy() {
 
 	for {
-		client := <-ws.destroyClient
+		select {
+		case client := <-ws.destroyClient:
 
-		if client.clientId > 0 {
-			ws.config.logHandler.PreLogoff(client.clientId)
-			client.clientId = -1
+			if client.clientId > 0 {
+				ws.config.logHandler.PreLogoff(client.clientId)
+				client.clientId = -1
+			}
+
+			ws.DestroyClient(client)
+			break
+
+		case <-time.After(time.Second):
+
+			if atomic.LoadInt32(&ws.shutdown) != 0 {
+				return
+			}
 		}
 
-		ws.DestroyClient(client)
 	}
 }
 
@@ -140,48 +186,11 @@ func (ws *WanServer) DestroyClient(client *tagClient) {
 	// 删除认证
 	ws.unauthClient.Delete(client.connection)
 
-	// 丢弃所有包
-	/*
-		clear := false
-		for {
-			if clear {
-				break
-			}
-
-			select {
-			case <-client.sendQueue:
-				break
-			default:
-				clear = true
-				break
-			}
-		}
-	*/
-
-	clear := false
-	for {
-		if clear {
-			break
-		}
-
-		select {
-		case <-client.recvQueue:
-			break
-		default:
-			clear = true
-			break
-		}
-	}
-
 	// 销毁
 	client.connection.Close()
 
 	// 重置
-	client.clientId = -1
-	client.connection = nil
-	client.connectTime = 0
-	client.recvSerial = 0
-	atomic.StoreInt32(&client.shutdown, 0)
+	client.Reset()
 
 	// 回收
 	ws.freeClient <- client
@@ -199,11 +208,9 @@ func (ws *WanServer) OnOpened(c gnet.Conn) (out []byte, action gnet.Action) {
 
 	select {
 	case client := <-ws.freeClient:
-		client.clientId = -1
+		client.Reset()
 		client.connection = c
 		client.connectTime = int64(time.Now().UnixNano() / 1000)
-		client.recvSerial = 0
-		atomic.StoreInt32(&client.shutdown, 0)
 		ws.unauthClient.Store(c, client)
 		ws.connectedSockets.Store(c, client)
 		break
@@ -248,7 +255,7 @@ func (ws *WanServer) React(frame []byte, c gnet.Conn) (out []byte, action gnet.A
 		}
 
 		var param tagLoginParam
-		param.client = client
+		param.handle = client
 		param.addr = c.RemoteAddr().String()
 
 		client.clientId = ws.config.logHandler.Logon(frame, &param)
@@ -256,6 +263,12 @@ func (ws *WanServer) React(frame []byte, c gnet.Conn) (out []byte, action gnet.A
 			ws.DisconnectClient(client, 0)
 			return
 		}
+
+		ws.wg.Add(1)
+		ants.Submit(func() {
+			ws.RoutineSend(client)
+			ws.wg.Done()
+		})
 	}
 
 	select {
@@ -293,8 +306,46 @@ type tagClient struct {
 	shutdown   int32
 }
 
+func (c *tagClient) Reset() {
+	c.clientId = -1
+	c.connection = nil
+	c.connectTime = 0
+	c.recvSerial = 0
+	atomic.StoreInt32(&c.shutdown, 0)
+
+	clear := false
+	for {
+		if clear {
+			break
+		}
+
+		select {
+		case <-c.sendQueue:
+			break
+		default:
+			clear = true
+			break
+		}
+	}
+
+	clear = false
+	for {
+		if clear {
+			break
+		}
+
+		select {
+		case <-c.recvQueue:
+			break
+		default:
+			clear = true
+			break
+		}
+	}
+}
+
 type tagLoginParam struct {
-	client *tagClient
+	handle interface{}
 	addr   string
 }
 
@@ -326,9 +377,4 @@ func newTagConfig(logHandler LogHandler) *tagConfig {
 		maxSend:     5120,
 		maxRecv:     128,
 	}
-}
-
-func main() {
-	push := &WanServer{tick: 10000000000}
-	log.Fatal(gnet.Serve(push, "tcp://:9000", gnet.WithMulticore(true), gnet.WithTicker(true)))
 }
