@@ -19,7 +19,7 @@ type WanServer struct {
 	wg               sync.WaitGroup
 	shutdown         int32
 
-	config tagConfig
+	config WanConfig
 
 	client        []tagClient
 	freeClient    chan *tagClient
@@ -27,7 +27,7 @@ type WanServer struct {
 }
 
 // 初始化
-func (ws *WanServer) Init(param *tagConfig) {
+func (ws *WanServer) Init(param *WanConfig) {
 	ws.config = *param
 	ws.client = make([]tagClient, ws.config.maxLoad)
 	ws.freeClient = make(chan *tagClient, ws.config.maxLoad)
@@ -254,7 +254,7 @@ func (ws *WanServer) React(frame []byte, c gnet.Conn) (out []byte, action gnet.A
 			return
 		}
 
-		var param tagLoginParam
+		var param LoginParam
 		param.handle = client
 		param.addr = c.RemoteAddr().String()
 
@@ -344,17 +344,17 @@ func (c *tagClient) Reset() {
 	}
 }
 
-type tagLoginParam struct {
+type LoginParam struct {
 	handle interface{}
 	addr   string
 }
 
 type LogHandler interface {
-	Logon(msg []byte, param *tagLoginParam) int
+	Logon(msg []byte, param *LoginParam) int
 	PreLogoff(clientId int)
 }
 
-type tagConfig struct {
+type WanConfig struct {
 	logHandler LogHandler
 
 	port     int
@@ -367,8 +367,8 @@ type tagConfig struct {
 	maxRecv int
 }
 
-func newTagConfig(logHandler LogHandler) *tagConfig {
-	return &tagConfig{
+func NewWanConfig(logHandler LogHandler) *WanConfig {
+	return &WanConfig{
 		logHandler:  logHandler,
 		port:        6008,
 		maxLoad:     5000,
